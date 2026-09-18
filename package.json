@@ -1,0 +1,30 @@
+{
+  "name": "sg-property-collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "collect": "node --env-file-if-exists=.env --import tsx src/cli.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "csv-parse": "^7.0.2",
+    "pino": "^10.3.1",
+    "postgres": "^3.4.9",
+    "tsx": "^4.23.13",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^12.1.0",
+    "@types/node": "^22.20.3",
+    "typescript": "5.9",
+    "vitest": "^5.0.1"
+  }
+}

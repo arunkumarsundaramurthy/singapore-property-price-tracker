@@ -1,0 +1,7 @@
+node_modules/
+.env
+data/
+raw/
+backups/
+logs/
+*.lock
