@@ -34,55 +34,53 @@ A single TypeScript application with pluggable collectors, a Postgres database, 
 
 ```
 cron (03:00 SGT)
-  └─ docker compose run --rm collector collect --all
+  └─ docker compose run --rm collector run --all
        ├─ official collectors (sequential): hdb-resale, hdb-rental, ura-private-txn, ura-private-rental
        └─ listing collectors (sequential):  99co, propertyguru, srx
-            each: fetch → archive raw → parse → validate → upsert → record run
+            each: fetch → archive raw → read archive back → parse → validate → write (one DB transaction) → record run
 ```
+
+Every collector writes what it fetches to the raw archive, and ingestion always reads it back from there. A daily run, a reprocess, and a dry run therefore share the same ingest path. Ingestion for one source runs inside a single database transaction.
 
 ### Collector interface
 
 ```ts
 interface Collector {
-  name: string;                       // e.g. "hdb-resale", "99co"
-  run(ctx: CollectorContext, opts: RunOptions): Promise<RunResult>;
+  name: string;                                   // e.g. "hdb-resale", "99co"
+  kind: 'official' | 'listing';
+  fetch(ctx: FetchContext, emit: (p: Payload) => Promise<void>): Promise<{ complete: boolean }>;
+  ingest(tx: Sql, payloads: AsyncIterable<Payload>, ctx: IngestContext): Promise<IngestResult>;
 }
 
-interface CollectorContext {
-  fetcher: Fetcher;                   // HTTP client or Playwright-backed browser fetcher
-  archive: RawArchive;                // writes raw/<source>/<YYYY-MM-DD>/<name>.json.gz
-  db: Db;
-  logger: Logger;
-  runId: number;
-}
-
-interface RunOptions { backfill?: boolean; dryRun?: boolean; limit?: number; }
-
-interface RunResult {
-  fetched: number; inserted: number; changed: number; rejected: number;
-  complete: boolean;                  // listing collectors: true only if every slice finished
-}
+interface Payload { key: string; body: string }  // one raw response (CSV or JSON text)
+interface RunOptions { backfill: boolean; dryRun: boolean; limit?: number }   // limit = max payloads fetched
+interface FetchContext { runDate: string; logger: Logger; options: RunOptions }
+interface IngestContext { runId: number; runDate: string; logger: Logger; backfill: boolean; dryRun: boolean; fetchComplete: boolean }
+interface IngestResult { fetched: number; inserted: number; changed: number; rejected: number; complete: boolean }
 ```
 
-`Fetcher` is an interface with two implementations: `HttpFetcher` (undici/fetch) and `BrowserFetcher` (Playwright via `playwright-extra` with a stealth plugin). A future `ProxyFetcher` plugs in without changing collectors.
+`Fetcher` is an interface. `HttpFetcher` (built on Node's fetch) is used by the official collectors. A Playwright-backed `BrowserFetcher` is added together with the listing collectors, and a future `ProxyFetcher` plugs in without changing collectors.
 
 ### Project layout
 
 ```
 src/
-  cli.ts                      # collect --all | collect <source> [--backfill|--dry-run|--limit N] | collect status | collect reprocess <source> --from <date>
-  runner.ts                   # runs collectors in order, isolates failures, lock file, healthcheck ping
-  fetch/http.ts, fetch/browser.ts
-  archive.ts
-  db/                         # schema migrations, queries
-  collectors/
-    hdb-resale.ts, hdb-rental.ts, ura-private-txn.ts, ura-private-rental.ts
-    listings/99co.ts, listings/propertyguru.ts, listings/srx.ts
-    listings/upsert.ts        # shared change-tracking and delisting logic
-  schemas/                    # zod schemas per source and for NormalizedListing
+  cli.ts                 # run [sources...] [--all] [--backfill] [--dry-run] [--limit N] | status | reprocess <source> --from <date> | migrate
+  runner.ts              # runs collectors in order, isolates failures, dry-run rollback, reprocess
+  config.ts, time.ts, archive.ts, runs.ts, lock.ts, health.ts
+  fetch/                 # Fetcher interface, HttpFetcher (BrowserFetcher added with the listing collectors)
+  db/                    # client, migrator, migrations/*.sql
+  collectors/            # Collector types and the registry of all collectors
+  official/              # data.gov.sg and URA clients, the four official collectors, replace-by-period
+  listings/              # NormalizedListing schema, upsert and delisting engine (site collectors added later)
 test/
-  fixtures/<source>/...       # saved real responses
+  unit/, integration/, support/
 ```
+
+### Delivery in two plans
+
+1. **Plan 1:** the foundation, the four official collectors, the listing change-tracking engine (tested without any site), the command line, and the operational setup.
+2. **Plan 2:** the three listing site collectors and `BrowserFetcher`. A plain request to each of the three sites returned a Cloudflare challenge (HTTP 403) on 2026-09-18, so Plan 2 starts with a test of Playwright with stealth against each site and saves real pages as fixtures.
 
 ## Data model (Postgres)
 
@@ -128,6 +126,8 @@ Backfill uses the same mechanism over all available periods. URA only serves abo
 | first_seen, last_seen | dates |
 | status | `active` / `delisted` |
 | missed_complete_runs | int; the delisting counter |
+| last_missed_on | date; stops a same-day re-run from counting a miss twice |
+| updated_run_id | run that last wrote the row |
 
 **`listing_versions`**: a new row only when a tracked field changes.
 
@@ -150,7 +150,7 @@ Re-running on the same day with unchanged data produces no new versions.
 
 ### `runs`
 
-id, source, started_at, finished_at, status (`success` / `incomplete` / `failed`), fetched, inserted, changed, rejected, error (text), is_backfill.
+id, source, started_at, finished_at, status (`success` / `incomplete` / `failed`), fetched, inserted, changed, rejected, error (text), mode (`daily` / `backfill` / `reprocess` / `dry-run`).
 
 ## Collectors
 
@@ -160,8 +160,8 @@ id, source, started_at, finished_at, status (`success` / `incomplete` / `failed`
   - Backfill: download all HDB resale datasets from data.gov.sg (split by period: 1990–1999, 2000–Feb 2012, Mar 2012–2014, 2015–2016, 2017–present).
   - Daily: download the current (2017–present) dataset and replace the latest 3 months.
 - **hdb-rental**: the "renting out of flats" dataset (2021–present), same pattern.
-- **ura-private-txn**: each run exchanges the AccessKey for a daily token, then fetches the private residential transactions service for batches 1–4 (split by postal district) and replaces every contract month present.
-- **ura-private-rental**:
+- **ura-private-txn**: each run exchanges the AccessKey for a daily token, then fetches `PMI_Resi_Transaction` for batches 1–4 (split by postal district). It replaces every contract month in the response **except the earliest**: URA serves a rolling 5-year window, so the earliest month may be only partly included. Ingestion requires all 4 batches, because a replaced month spans every district. `typeOfSale` codes are mapped as 1 = new sale, 2 = sub sale, 3 = resale. URA publishes transactions every Tuesday and Friday.
+- **ura-private-rental**: fetches `PMI_Resi_Rental` by `refPeriod`. URA publishes rentals monthly, on the 15th; a daily pull is still safe because replacing a quarter is idempotent.
   - Daily: fetch the rental contracts service for the latest 2 quarters, e.g. `refPeriod=26q3`, and replace them.
   - Backfill: all quarters URA serves.
 
@@ -192,15 +192,15 @@ Several details above come from prior knowledge and have not been checked agains
 
 - **Isolation:** each collector runs in its own try/catch and database transaction. A crash rolls back only that source, records `failed` in `runs`, and the runner continues.
 - **Idempotency:** re-running any collector on the same day yields the same database state.
-- **Validation:** every parsed record goes through a zod schema. Invalid records are skipped, counted in `rejected`, and a sample is logged. If rejects are above **5%**, or price or size is missing on more than 5% of records, the run is marked `incomplete`.
+- **Validation:** every parsed record goes through a zod schema. Invalid records are skipped, counted in `rejected`, and a sample is logged. For listings, if rejects are above **5%** or size is missing on more than 5% of records, the run is marked `incomplete` (price is required by the schema). For official data, a reject rate above 5% fails the run before anything is written.
 - **Volume guards:**
-  - Official: if a download returns fewer rows for the replaced periods than are already stored, the replacement is skipped and the run is marked `failed`.
+  - Official: if a download returns fewer than **95%** of the rows already stored for the periods being replaced, nothing is replaced and the run is marked `failed`. The 5% tolerance allows for transactions the source withdraws.
   - Listings: if a site returns fewer than 50% of the previous day's active count for that source, the run is marked `incomplete`.
 - **Retries:**
   - HTTP errors and timeouts: 3 attempts, exponential backoff.
   - Blocked pages: 2 retries.
   - URA token expiry: refresh once.
-- **Reprocessing:** `collect reprocess <source> --from <date>` re-parses archived raw responses into the database without fetching anything.
+- **Reprocessing:** `npm run collect -- reprocess <source> --from <date>` re-parses archived raw responses into the database without fetching anything.
 
 ## Deployment and operations
 
@@ -209,14 +209,14 @@ Several details above come from prior knowledge and have not been checked agains
   - `postgres` runs continuously, with data on a named volume.
   - `collector` is built on the official Playwright Node image and runs on demand.
 - **Deployment:** `git pull && docker compose build` on the VM.
-- **Schedule:** host crontab, daily at 03:00 SGT: `docker compose run --rm collector collect --all`. A lock file prevents overlapping runs. Official collectors run first, then listings; expect about 1–3 hours total.
+- **Schedule:** host crontab, daily at 03:00 SGT: `docker compose run --rm collector run --all`. A lock file prevents overlapping runs. Official collectors run first, then listings; expect about 1–3 hours total.
 - **Monitoring:**
-  - `collect status` prints the last 7 days of `runs`.
+  - `status` prints the last 7 days of `runs`.
   - Optional healthchecks.io ping, enabled when `HEALTHCHECK_URL` is set. The runner signals success at the end of a run and failure when any official collector failed or any listing source has been incomplete for 3 consecutive days.
 - **Backups:** nightly `pg_dump` (gzipped), keeping 14 days on the VM. Copying off the VM is a later addition.
 - **Raw archive retention:** official responses are kept forever. Listing responses are kept for 60 days and pruned by the runner.
 
-Configuration comes from environment variables: `DATABASE_URL`, `URA_ACCESS_KEY`, `HEALTHCHECK_URL` (optional), `RAW_ARCHIVE_DIR`, `LISTING_PAGE_CAP`, `LISTING_DELAY_MS_MIN/MAX`.
+Configuration comes from environment variables: `DATABASE_URL`, `URA_ACCESS_KEY`, `DATA_GOV_SG_API_KEY` (optional; without it data.gov.sg rate-limits to about one request per 10 seconds, which the client handles by waiting), `HEALTHCHECK_URL` (optional), `RAW_ARCHIVE_DIR`, `LOCK_FILE`, `LOG_LEVEL`. The listing collectors add `LISTING_PAGE_CAP` and `LISTING_DELAY_MS_MIN/MAX`.
 
 ## Testing
 
@@ -230,7 +230,7 @@ Configuration comes from environment variables: `DATABASE_URL`, `URA_ACCESS_KEY`
   - a delisted listing that reappears becomes active again
 - **Database integration tests** against real Postgres via Testcontainers: replace-by-period (including genuine duplicate rows), volume guards, and idempotent re-runs. The database is not mocked.
 - **Collector tests:** each collector runs end to end against a fixture-backed fake `Fetcher`, and the test checks the `runs` row and table contents.
-- **No live-site tests in CI.** `collect <source> --dry-run --limit 2` is used by hand to check real fetch and parse after deployment.
+- **No live-site tests in CI.** `npm run collect -- run <source> --dry-run --limit 2` is used by hand to check real fetch and parse after deployment.
 - **When a portal changes:** capture a new fixture, fix the parser until the tests pass, then run `reprocess` over the affected days.
 
 ## Out of scope (for now)
