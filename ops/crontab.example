@@ -1,0 +1,7 @@
+# The VM's timezone must be Asia/Singapore:  sudo timedatectl set-timezone Asia/Singapore
+# Install with:  crontab ops/crontab.example   (after editing the path)
+SHELL=/bin/bash
+APP=/opt/sg-property-price-tracker
+
+30 2 * * * cd $APP && ./ops/backup.sh >> logs/backup.log 2>&1
+0 3 * * *  cd $APP && docker compose run --rm collector run --all >> logs/collect.log 2>&1
